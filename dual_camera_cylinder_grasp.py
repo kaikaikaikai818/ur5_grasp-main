@@ -55,7 +55,7 @@ MAX_DEPTH_SPREAD_MM = 8.0
 MAX_BASE_SPREAD_M = 0.008
 AUTO_SETTLE_SECONDS = 0.8
 AUTO_DETECTION_TIMEOUT_SECONDS = 8.0
-MAX_RECHECK_SHIFT_M = 0.010
+MAX_RECHECK_XY_SHIFT_M = 0.010
 
 GRIPPER_PORT = "COM10"
 GRIPPER_OPEN_POSITION = 6000
@@ -138,7 +138,7 @@ def ho_pixel_to_base(u, v, raw_depth_value, depth_scale, transform):
     return result if np.all(np.isfinite(result)) else None
 
 
-def safe_move(robot, position, source):
+def validate_motion_target(position):
     target = np.asarray(position, dtype=np.float64)
     if target.shape != (3,) or not np.all(np.isfinite(target)):
         raise ValueError("invalid target position")
@@ -147,6 +147,11 @@ def safe_move(robot, position, source):
                          (target[2], MIN_TCP_Z_M))
     if not in_workspace(target):
         raise ValueError("target is outside workspace: %s" % np.round(target, 4))
+    return target
+
+
+def safe_move(robot, position, source):
+    target = validate_motion_target(position)
     current = np.asarray(robot.get_actual_tcp_pose(), dtype=np.float64)
     xy_step = float(np.linalg.norm(target[:2] - current[:2]))
     if xy_step > MAX_XY_STEP_M:
@@ -364,6 +369,7 @@ def main():
                         print("[BLOCK] lock HI first")
                     else:
                         grasp_tcp = calculate_tcp_grasp_position(hi_target, cylinder_height_m)
+                        validate_motion_target(grasp_tcp)
                         pregrasp = grasp_tcp.copy(); pregrasp[2] += PREGRASP_CLEARANCE_M
                         safe_move(robot, pregrasp, "HI-pregrasp")
                         stage = Stage.AT_PREGRASP
@@ -418,6 +424,8 @@ def main():
                     elif stage == Stage.HI_LOCKED:
                         grasp_tcp = calculate_tcp_grasp_position(
                             hi_target, cylinder_height_m)
+                        # Validate the eventual descent before moving any closer.
+                        validate_motion_target(grasp_tcp)
                         pregrasp = grasp_tcp.copy()
                         pregrasp[2] += PREGRASP_CLEARANCE_M
                         safe_move(robot, pregrasp, "AUTO-HI-pregrasp")
@@ -430,12 +438,22 @@ def main():
                         if stable_detection(hi_history):
                             verified = median_stable(hi_base_history)
                             if verified is not None:
-                                shift = float(np.linalg.norm(verified - hi_target))
-                                if shift > MAX_RECHECK_SHIFT_M:
+                                xy_shift = float(np.linalg.norm(
+                                    verified[:2] - hi_target[:2]))
+                                z_shift = float(verified[2] - hi_target[2])
+                                if xy_shift > MAX_RECHECK_XY_SHIFT_M:
                                     raise RuntimeError(
-                                        "target shifted %.1f mm after pregrasp (limit %.1f mm)" %
-                                        (shift * 1000.0, MAX_RECHECK_SHIFT_M * 1000.0))
-                                hi_target = verified
+                                        "target XY shifted %.1f mm after pregrasp (limit %.1f mm)" %
+                                        (xy_shift * 1000.0,
+                                         MAX_RECHECK_XY_SHIFT_M * 1000.0))
+                                # Near the object, depth can change because of
+                                # occlusion/noise.  Recheck and refine XY only;
+                                # preserve the observation-pose Z used to plan
+                                # the already validated grasp height.
+                                print("[AUTO] pre-descent check: XY shift=%.1f mm, "
+                                      "ignored Z change=%+.1f mm" %
+                                      (xy_shift * 1000.0, z_shift * 1000.0))
+                                hi_target[:2] = verified[:2]
                                 grasp_tcp = calculate_tcp_grasp_position(
                                     hi_target, cylinder_height_m)
                                 safe_move(robot, grasp_tcp, "AUTO-descend")
