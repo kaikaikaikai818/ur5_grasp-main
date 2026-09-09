@@ -60,10 +60,10 @@ GRIPPER_CLOSED_POSITION = 11000
 GRIPPER_SPEED = 80
 GRIPPER_FORCE = 60
 
-# Must be measured by teaching before descent is enabled.  This is the vector
-# from UR TCP to the actual centre of the fingers, expressed in base axes for
-# the fixed TOOL_ORIENTATION used above.
-TCP_TO_GRASP_CENTER_M = None
+# TCP_clamp is configured on the UR teach pendant at the actual finger centre
+# (flange Z offset 265 mm).  UR poses already include that tool length, so no
+# second compensation is applied in Python.
+TCP_TO_GRASP_CENTER_M = np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
 
 class Stage:
@@ -163,7 +163,14 @@ def calculate_tcp_grasp_position(top_center_base, cylinder_height_m):
 def main():
     args = parse_args()
     cylinder_height_m = None
-    if TCP_TO_GRASP_CENTER_M is not None:
+    if not args.camera_only:
+        confirmation = input(
+            "Confirm the active UR TCP is TCP_clamp (265 mm at finger centre). "
+            "Type YES to continue: "
+        ).strip()
+        if confirmation != "YES":
+            print("[SAFE] TCP_clamp was not confirmed; exiting without connecting robot")
+            return
         text = input("Cylinder height in millimetres: ").strip()
         cylinder_height_m = float(text) / 1000.0
         if cylinder_height_m <= 0:
@@ -210,8 +217,8 @@ def main():
 
         print("Keys: l lock HO | m move observe | i lock HI | p pregrasp | d descend")
         print("      o open | g close | u lift | r reset cycle | q quit")
-        if TCP_TO_GRASP_CENTER_M is None:
-            print("[SAFE] TCP offset is unset: p/d are intentionally disabled")
+        if not args.camera_only:
+            print("[TCP] Using active UR TCP_clamp; Python extra offset is [0, 0, 0] m")
 
         while True:
             ho_color, ho_depth = ho_cam.get_data()
@@ -303,8 +310,6 @@ def main():
                 elif key == ord("p"):
                     if stage != Stage.HI_LOCKED or robot is None:
                         print("[BLOCK] lock HI first")
-                    elif TCP_TO_GRASP_CENTER_M is None:
-                        print("[BLOCK] measure and set TCP_TO_GRASP_CENTER_M first")
                     else:
                         grasp_tcp = calculate_tcp_grasp_position(hi_target, cylinder_height_m)
                         pregrasp = grasp_tcp.copy(); pregrasp[2] += PREGRASP_CLEARANCE_M
