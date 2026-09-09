@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Safe, staged red-cylinder grasp with eye-out and eye-in RealSense cameras."""
+"""Safe one-key or staged red-cylinder grasp with two RealSense cameras."""
 
 from __future__ import annotations
 
@@ -53,6 +53,9 @@ STABLE_WINDOW = 8
 MAX_CENTER_SPREAD_PX = 5.0
 MAX_DEPTH_SPREAD_MM = 8.0
 MAX_BASE_SPREAD_M = 0.008
+AUTO_SETTLE_SECONDS = 0.8
+AUTO_DETECTION_TIMEOUT_SECONDS = 8.0
+MAX_RECHECK_SHIFT_M = 0.010
 
 GRIPPER_PORT = "COM10"
 GRIPPER_OPEN_POSITION = 6000
@@ -78,12 +81,16 @@ class Stage:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Staged dual-camera red-cylinder grasp")
-    parser.add_argument("--ho-z-offset", type=float, default=0.0,
-                        help="Optional eye-out Z correction in metres (default: 0)")
+    parser = argparse.ArgumentParser(description="One-key dual-camera red-cylinder grasp")
+    parser.add_argument("--ho-z-offset", type=float, default=0.026,
+                        help="Eye-out Z correction in metres (default: 0.026)")
+    parser.add_argument("--cylinder-height-mm", type=float, default=50.0,
+                        help="Cylinder height in millimetres (default: 50)")
     parser.add_argument("--gripper-port", default=GRIPPER_PORT)
     parser.add_argument("--camera-only", action="store_true",
                         help="Run detection without connecting robot or gripper")
+    parser.add_argument("--manual", action="store_true",
+                        help="Use the original staged L/M/I/P/D/G/U controls")
     return parser.parse_args()
 
 
@@ -162,7 +169,11 @@ def calculate_tcp_grasp_position(top_center_base, cylinder_height_m):
 
 def main():
     args = parse_args()
-    cylinder_height_m = None
+    if not math.isfinite(args.cylinder_height_mm) or args.cylinder_height_mm <= 0.0:
+        raise ValueError("--cylinder-height-mm must be positive")
+    if not math.isfinite(args.ho_z_offset):
+        raise ValueError("--ho-z-offset must be finite")
+    cylinder_height_m = args.cylinder_height_mm / 1000.0
     ho_depth_scale = None
     ho_transform = None
     if not args.camera_only:
@@ -189,11 +200,6 @@ def main():
         if confirmation != "YES":
             print("[SAFE] TCP_clamp was not confirmed; exiting without connecting robot")
             return
-        text = input("Cylinder height in millimetres: ").strip()
-        cylinder_height_m = float(text) / 1000.0
-        if cylinder_height_m <= 0:
-            raise ValueError("cylinder height must be positive")
-
     robot = None
     gripper = None
     ho_cam = None
@@ -228,11 +234,21 @@ def main():
         ho_target = None
         hi_target = None
         grasp_tcp = None
+        auto_running = False
+        auto_not_before = 0.0
+        auto_deadline = 0.0
 
-        print("Keys: l lock HO | m move observe | i lock HI | p pregrasp | d descend")
-        print("      o open | g close | u lift | r reset cycle | q quit")
+        if args.camera_only:
+            print("Camera-only mode: detection only | q quit")
+        elif args.manual:
+            print("Manual keys: l lock HO | m move observe | i lock HI | p pregrasp | d descend")
+            print("             o open | g close | u lift | r reset cycle | q quit")
+        else:
+            print("One-key mode: A start automatic grasp | O open | R reset | Q quit")
         if not args.camera_only:
             print("[TCP] Using active UR TCP_clamp; Python extra offset is [0, 0, 0] m")
+            print("[CONFIG] cylinder_height=%.1f mm, HO_Z_offset=%.3f m" %
+                  (args.cylinder_height_mm, args.ho_z_offset))
 
         while True:
             ho_color, ho_depth = ho_cam.get_data()
@@ -288,8 +304,29 @@ def main():
                 if key == ord("r"):
                     stage = Stage.WAIT_HO
                     ho_target = hi_target = grasp_tcp = None
+                    auto_running = False
+                    ho_history.clear(); ho_base_history.clear()
+                    hi_history.clear(); hi_base_history.clear()
                     print("[RESET] new cycle")
-                elif key == ord("l"):
+                elif key == ord("a") and not args.manual:
+                    if args.camera_only or robot is None:
+                        print("[BLOCK] automatic grasp is unavailable in camera-only mode")
+                    elif gripper is None:
+                        print("[BLOCK] gripper unavailable; automatic motion disabled")
+                    elif stage != Stage.WAIT_HO:
+                        print("[BLOCK] press R before starting a new automatic grasp")
+                    elif not stable_detection(ho_history):
+                        print("[BLOCK] HO detection is not stable; keep the cylinder visible")
+                    else:
+                        ho_target = median_stable(ho_base_history)
+                        if ho_target is None:
+                            print("[BLOCK] HO base coordinates are not stable")
+                        else:
+                            stage = Stage.HO_LOCKED
+                            auto_running = True
+                            print("[AUTO] started")
+                            print("[LOCK:HO]", np.round(ho_target, 4))
+                elif key == ord("l") and args.manual:
                     if stage != Stage.WAIT_HO:
                         print("[BLOCK] HO can only be locked at WAIT_HO")
                     elif not stable_detection(ho_history):
@@ -301,7 +338,7 @@ def main():
                         else:
                             stage = Stage.HO_LOCKED
                             print("[LOCK:HO]", np.round(ho_target, 4))
-                elif key == ord("m"):
+                elif key == ord("m") and args.manual:
                     if stage != Stage.HO_LOCKED or robot is None:
                         print("[BLOCK] lock HO and connect robot first")
                     else:
@@ -310,7 +347,7 @@ def main():
                         safe_move(robot, observe, "HO-observe")
                         stage = Stage.AT_OBSERVE
                         hi_history.clear(); hi_base_history.clear()
-                elif key == ord("i"):
+                elif key == ord("i") and args.manual:
                     if stage != Stage.AT_OBSERVE:
                         print("[BLOCK] move to observation pose first")
                     elif not stable_detection(hi_history):
@@ -322,7 +359,7 @@ def main():
                         else:
                             stage = Stage.HI_LOCKED
                             print("[LOCK:HI]", np.round(hi_target, 4))
-                elif key == ord("p"):
+                elif key == ord("p") and args.manual:
                     if stage != Stage.HI_LOCKED or robot is None:
                         print("[BLOCK] lock HI first")
                     else:
@@ -330,7 +367,7 @@ def main():
                         pregrasp = grasp_tcp.copy(); pregrasp[2] += PREGRASP_CLEARANCE_M
                         safe_move(robot, pregrasp, "HI-pregrasp")
                         stage = Stage.AT_PREGRASP
-                elif key == ord("d"):
+                elif key == ord("d") and args.manual:
                     if stage != Stage.AT_PREGRASP or robot is None:
                         print("[BLOCK] reach pregrasp first")
                     else:
@@ -342,14 +379,14 @@ def main():
                     else:
                         gripper.grip(GRIPPER_OPEN_POSITION, GRIPPER_SPEED, GRIPPER_FORCE)
                         print("[GRIPPER] opened")
-                elif key == ord("g"):
+                elif key == ord("g") and args.manual:
                     if stage != Stage.AT_GRASP or gripper is None:
                         print("[BLOCK] descend and connect gripper first")
                     else:
                         pos = gripper.grip(GRIPPER_CLOSED_POSITION, GRIPPER_SPEED, GRIPPER_FORCE)
                         print("[GRIPPER] closed, position=", pos)
                         stage = Stage.GRIPPED
-                elif key == ord("u"):
+                elif key == ord("u") and args.manual:
                     if stage != Stage.GRIPPED or robot is None:
                         print("[BLOCK] close gripper first")
                     else:
@@ -357,7 +394,70 @@ def main():
                         current[2] += LIFT_DISTANCE_M
                         safe_move(robot, current, "lift")
                         stage = Stage.LIFTED
+
+                if auto_running:
+                    now = time.monotonic()
+                    if stage == Stage.HO_LOCKED:
+                        observe = ho_target.copy()
+                        observe[2] += OBSERVE_CLEARANCE_M
+                        safe_move(robot, observe, "AUTO-HO-observe")
+                        stage = Stage.AT_OBSERVE
+                        hi_history.clear(); hi_base_history.clear()
+                        auto_not_before = time.monotonic() + AUTO_SETTLE_SECONDS
+                        auto_deadline = time.monotonic() + AUTO_DETECTION_TIMEOUT_SECONDS
+                        print("[AUTO] waiting for fresh stable HI detection")
+                    elif stage == Stage.AT_OBSERVE and now >= auto_not_before:
+                        if stable_detection(hi_history):
+                            candidate = median_stable(hi_base_history)
+                            if candidate is not None:
+                                hi_target = candidate
+                                stage = Stage.HI_LOCKED
+                                print("[LOCK:HI]", np.round(hi_target, 4))
+                        if stage == Stage.AT_OBSERVE and now > auto_deadline:
+                            raise RuntimeError("HI detection did not become stable before timeout")
+                    elif stage == Stage.HI_LOCKED:
+                        grasp_tcp = calculate_tcp_grasp_position(
+                            hi_target, cylinder_height_m)
+                        pregrasp = grasp_tcp.copy()
+                        pregrasp[2] += PREGRASP_CLEARANCE_M
+                        safe_move(robot, pregrasp, "AUTO-HI-pregrasp")
+                        stage = Stage.AT_PREGRASP
+                        hi_history.clear(); hi_base_history.clear()
+                        auto_not_before = time.monotonic() + AUTO_SETTLE_SECONDS
+                        auto_deadline = time.monotonic() + AUTO_DETECTION_TIMEOUT_SECONDS
+                        print("[AUTO] verifying target again before descent")
+                    elif stage == Stage.AT_PREGRASP and now >= auto_not_before:
+                        if stable_detection(hi_history):
+                            verified = median_stable(hi_base_history)
+                            if verified is not None:
+                                shift = float(np.linalg.norm(verified - hi_target))
+                                if shift > MAX_RECHECK_SHIFT_M:
+                                    raise RuntimeError(
+                                        "target shifted %.1f mm after pregrasp (limit %.1f mm)" %
+                                        (shift * 1000.0, MAX_RECHECK_SHIFT_M * 1000.0))
+                                hi_target = verified
+                                grasp_tcp = calculate_tcp_grasp_position(
+                                    hi_target, cylinder_height_m)
+                                safe_move(robot, grasp_tcp, "AUTO-descend")
+                                stage = Stage.AT_GRASP
+                        if stage == Stage.AT_PREGRASP and now > auto_deadline:
+                            raise RuntimeError("target verification timed out; descent cancelled")
+                    elif stage == Stage.AT_GRASP:
+                        pos = gripper.grip(
+                            GRIPPER_CLOSED_POSITION, GRIPPER_SPEED, GRIPPER_FORCE)
+                        print("[GRIPPER] closed, position=", pos)
+                        stage = Stage.GRIPPED
+                    elif stage == Stage.GRIPPED:
+                        current = np.asarray(
+                            robot.get_actual_tcp_pose()[:3], dtype=np.float64)
+                        current[2] += LIFT_DISTANCE_M
+                        safe_move(robot, current, "AUTO-lift")
+                        stage = Stage.LIFTED
+                        auto_running = False
+                        print("[AUTO] grasp complete; object is being held. "
+                              "Press O to open or R to reset.")
             except Exception as exc:
+                auto_running = False
                 print("[ERROR] action refused/failed:", exc)
 
     finally:
