@@ -163,7 +163,25 @@ def calculate_tcp_grasp_position(top_center_base, cylinder_height_m):
 def main():
     args = parse_args()
     cylinder_height_m = None
+    ho_depth_scale = None
+    ho_transform = None
     if not args.camera_only:
+        missing = [str(path) for path in (HO_CALIB_PATH, HO_DEPTH_SCALE_PATH)
+                   if not path.is_file()]
+        if missing:
+            raise FileNotFoundError("Missing eye-out calibration file(s): " + ", ".join(missing))
+
+        ho_transform = np.loadtxt(HO_CALIB_PATH)
+        if (ho_transform.shape != (4, 4)
+                or not np.all(np.isfinite(ho_transform))):
+            raise ValueError("camera_pose.txt must contain a finite 4x4 matrix")
+        if not np.allclose(ho_transform[3], [0.0, 0.0, 0.0, 1.0], atol=1e-6):
+            raise ValueError("camera_pose.txt must end with [0, 0, 0, 1]")
+
+        ho_depth_scale = float(np.loadtxt(HO_DEPTH_SCALE_PATH))
+        if not math.isfinite(ho_depth_scale) or ho_depth_scale <= 0.0:
+            raise ValueError("camera_depth_scale.txt must contain one positive number")
+
         confirmation = input(
             "Confirm the active UR TCP is TCP_clamp (265 mm at finger centre). "
             "Type YES to continue: "
@@ -201,10 +219,6 @@ def main():
             hi_camera_only = Camera(serial=HI_SERIAL)
 
         ho_cam = Camera(serial=HO_SERIAL)
-        ho_depth_scale = float(np.loadtxt(HO_DEPTH_SCALE_PATH))
-        ho_transform = np.loadtxt(HO_CALIB_PATH)
-        if ho_transform.shape != (4, 4):
-            raise ValueError("eye-out calibration must be a 4x4 matrix")
         detector = RedCylinderDetector()
         stage = Stage.WAIT_HO
         ho_history = deque(maxlen=STABLE_WINDOW)
@@ -227,13 +241,14 @@ def main():
             if ho_res is not None and ho_res["z_mm"] is not None:
                 u, v = ho_res["center"]
                 ho_history.append((u, v, ho_res["z_mm"]))
-                pt = ho_pixel_to_base(
-                    u, v, ho_res["z_mm"], ho_depth_scale, ho_transform)
-                if pt is not None:
-                    pt = np.asarray(pt, dtype=np.float64)
-                    pt[2] += args.ho_z_offset
-                    if in_workspace(pt):
-                        ho_base_history.append(pt)
+                if not args.camera_only:
+                    pt = ho_pixel_to_base(
+                        u, v, ho_res["z_mm"], ho_depth_scale, ho_transform)
+                    if pt is not None:
+                        pt = np.asarray(pt, dtype=np.float64)
+                        pt[2] += args.ho_z_offset
+                        if in_workspace(pt):
+                            ho_base_history.append(pt)
             else:
                 ho_history.clear()
                 ho_base_history.clear()
