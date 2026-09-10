@@ -7,7 +7,7 @@
   ① 粗定位  手外 D455 检测红色圆柱 -> pixel_to_robot_coords -> 基座坐标
             -> 机械臂粗移到目标上方
   ② 精定位  手内 D435I 检测 -> pixel_to_base -> 细化基座坐标（多帧重试）
-            -> 精对齐到细化坐标上方；若多次失败则回退用粗定位坐标直接抓
+            -> 精对齐到细化坐标上方；若多次失败则立即中止，禁止下降抓取
   ③ 抓取   下降 -> 收爪 -> 抬起（只抓起+抬起，不含放置）
 
 按键：
@@ -50,7 +50,7 @@ LIFT_Z_OFFSET = 0.15          # 抓起后抬起高度
 HO_Z_OFFSET = 0.026           # 手外 D455 高度基准补偿（标定 z 整体偏低 0.026m）
 HI_Z_OFFSET = 0.0             # 手内 z 补偿（若顶面 z 偏低可微调）
 
-# 精定位：多次采样取有效值，若连续 REFINE_RETRY_N 次都失败则回退粗定位
+# 精定位：多次采样取有效值；若连续 REFINE_RETRY_N 次都失败则立即中止抓取
 REFINE_RETRY_N = 5
 
 # 夹爪
@@ -218,7 +218,7 @@ def do_grasp(robot, detector, state):
         robot.moveL(above, speed=0.05, acceleration=0.05)
         time.sleep(1)
 
-        # ② 精定位：手内多帧重试；失败则回退粗定位坐标
+        # ② 精定位：手内多帧重试；失败则立即中止，禁止使用粗定位坐标下降
         refined = refine_locate(robot, detector, REFINE_RETRY_N)
         if refined is not None:
             x, y, z = refined
@@ -227,9 +227,9 @@ def do_grasp(robot, detector, state):
             z = clamp(z, WORKSPACE_LIMITS[2])
             print("[②精定位] 手内 base = [%.3f, %.3f, %.3f]" % (x, y, z))
         else:
-            print("[②精定位] 连续 %d 次失败，回退用粗定位坐标直接抓" % REFINE_RETRY_N)
-            above = [x, y, z + LIFT_ABOVE] + TOOL_ORIENTATION
-            robot.moveL(above, speed=0.05, acceleration=0.05)
+            print("[安全中止] 手内精定位连续 %d 次失败，禁止使用粗定位坐标下降抓取" % REFINE_RETRY_N)
+            print("[安全中止] 机械臂保持在粗定位上方，夹爪保持打开；请检查目标和手内相机后重新按 g")
+            return
 
         # ③ 精对齐 -> 下降 -> 收爪 -> 抬起
         above = [x, y, z + LIFT_ABOVE] + TOOL_ORIENTATION
