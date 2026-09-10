@@ -5,13 +5,13 @@
 
 全流程（按 g 触发）：
   ① 粗定位  手外 D455 检测红色圆柱 -> pixel_to_robot_coords -> 基座坐标
-            -> 机械臂粗移到目标上方
+            -> TCP 垂直升到安全高度 -> 自动摆正并验证姿态 -> 粗移到目标上方
   ② 精定位  手内 D435I 检测 -> pixel_to_base -> 细化基座坐标（多帧重试）
             -> 精对齐到细化坐标上方；若多次失败则立即中止，禁止下降抓取
   ③ 抓取   下降 -> 收爪 -> 抬起（只抓起+抬起，不含放置）
 
 按键：
-  g 执行① ② ③     o 夹爪张开     c 夹爪闭合     q 退出
+  g 执行① ② ③     t 仅升高并摆正     o 夹爪张开     c 夹爪闭合     q 退出
 自检：
   --check-calib  启动时读两台相机实时内参，与标定内参比对，超阈值拒绝执行
   --gripper-test 交互式校定夹爪开/合 position
@@ -43,6 +43,8 @@ HO_CY = 237.200
 CALIB_TOL = 3.0
 
 TOOL_ORIENTATION = [3.141, 0.0, 0.0]   # 固定朝下 (RX, RY, RZ)
+ORIENTATION_SAFE_Z = 0.20     # 姿态归正前TCP至少升到此高度(m)
+ORIENTATION_TOL_DEG = 2.0     # 实际姿态与标准姿态的最大允许误差(度)
 LIFT_ABOVE = 0.05             # 目标正上方 50mm
 CYL_H = 0.03                  # 圆柱高(m)，用于下探深度下界（避免穿底）
 GRASP_DEPTH_OFFSET = 0.025    # 低于顶面 z 的下探深度（让手指跨住圆柱中下部）
@@ -103,8 +105,10 @@ def main():
     state = {"ho_base": None, "hi_base": None}
 
     print("\n操作说明:")
+    print("  [安全确认] 示教器活动TCP必须是 TCP_clamp，摆正路径周围必须无遮挡。")
     print("  红色圆柱会被自动检测（双视场）。")
-    print("  g -> 一键抓取：手外粗定位 -> 机械臂移到上方 -> 手内精定位 -> 下降收爪 -> 抬起")
+    print("  g -> 一键抓取：安全升高并摆正 -> 手外粗定位 -> 手内精定位 -> 下降收爪 -> 抬起")
+    print("  t -> 仅测试姿态归正：升高到安全高度 -> 摆正并验证；不会靠近圆柱或抓取")
     print("  o -> 夹爪张开     c -> 夹爪闭合     q -> 退出")
 
     try:
@@ -152,6 +156,9 @@ def main():
             elif key == ord('c'):
                 robot.grip(GRIP_CLOSE_POS, GRIP_SPEED, GRIP_FORCE)
                 print("[夹爪] 闭合 pos=%d" % GRIP_CLOSE_POS)
+            elif key == ord('t'):
+                print("[姿态测试] 仅执行安全升高和末端摆正，不执行抓取")
+                normalize_tool_pose(robot)
             elif key == ord('g'):
                 do_grasp(robot, detector, state)
     finally:
@@ -196,6 +203,77 @@ def check_calib(robot, ho_cam):
         raise RuntimeError("内参自检未通过，请检查相机/标定。不要继续执行抓取。")
 
 
+def _read_valid_tcp_pose(robot):
+    """读取并校验UR返回的[x,y,z,rx,ry,rz] TCP位姿。"""
+    pose = np.asarray(robot.get_actual_tcp_pose(), dtype=np.float64).reshape(-1)
+    if pose.size != 6 or not np.all(np.isfinite(pose)):
+        raise ValueError("无效TCP位姿: %s" % pose)
+    return pose
+
+
+def _orientation_error_deg(actual_rvec, target_rvec):
+    """用旋转矩阵夹角计算姿态误差，避免旋转向量等价表示造成误判。"""
+    actual_R, _ = cv2.Rodrigues(np.asarray(actual_rvec, dtype=np.float64).reshape(3, 1))
+    target_R, _ = cv2.Rodrigues(np.asarray(target_rvec, dtype=np.float64).reshape(3, 1))
+    delta_R = target_R @ actual_R.T
+    cos_angle = np.clip((np.trace(delta_R) - 1.0) / 2.0, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_angle)))
+
+
+def verify_tool_orientation(robot, stage):
+    """检查末端是否到达标准朝下姿态；读取或误差异常时返回False。"""
+    try:
+        actual = _read_valid_tcp_pose(robot)
+        error_deg = _orientation_error_deg(actual[3:6], TOOL_ORIENTATION)
+        print("[姿态验证:%s] 实际TCP=%s" %
+              (stage, ["%.4f" % v for v in actual]))
+        print("[姿态验证:%s] 与标准朝下姿态误差=%.3f°（允许≤%.1f°）" %
+              (stage, error_deg, ORIENTATION_TOL_DEG))
+        if error_deg > ORIENTATION_TOL_DEG:
+            print("[安全中止] 末端姿态未摆正，禁止继续靠近或下降")
+            return False
+        return True
+    except Exception as exc:
+        print("[安全中止] 无法验证末端姿态：%s" % exc)
+        return False
+
+
+def normalize_tool_pose(robot):
+    """先垂直升到安全高度，再原地摆正末端；失败时停止后续流程。"""
+    try:
+        current = _read_valid_tcp_pose(robot)
+        print("[姿态归正] 当前TCP=%s" % (["%.4f" % v for v in current],))
+
+        lift_target = current.copy()
+        lift_target[2] = max(float(current[2]), ORIENTATION_SAFE_Z)
+        print("[姿态归正] 安全抬升目标=%s" %
+              (["%.4f" % v for v in lift_target],))
+        if lift_target[2] > current[2] + 0.001:
+            robot.moveL(lift_target.tolist(), speed=0.05, acceleration=0.05)
+        else:
+            print("[姿态归正] 当前TCP已不低于安全高度，无需向下或重复抬升")
+
+        after_lift = _read_valid_tcp_pose(robot)
+        straighten_target = after_lift.copy()
+        straighten_target[3:6] = TOOL_ORIENTATION
+        print("[姿态归正] 标准姿态目标=%s" %
+              (["%.4f" % v for v in straighten_target],))
+        robot.moveL(straighten_target.tolist(), speed=0.05, acceleration=0.05)
+
+        if not verify_tool_orientation(robot, "摆正后"):
+            return False
+        print("[姿态归正] 完成，可以继续执行粗定位")
+        return True
+    except Exception as exc:
+        print("[安全中止] 姿态归正失败：%s" % exc)
+        try:
+            if robot.rtde_c is not None and hasattr(robot.rtde_c, "stopL"):
+                robot.rtde_c.stopL(1.0)
+        except Exception as stop_exc:
+            print("[提示] 停止直线运动命令执行失败，请使用示教器或急停检查：%s" % stop_exc)
+        return False
+
+
 def do_grasp(robot, detector, state):
     """一键全流程：① 粗定位 -> ② 精定位 -> ③ 下降收爪抬起；精定位失败则安全中止。"""
     coarse = state["ho_base"] or state["hi_base"]
@@ -213,9 +291,15 @@ def do_grasp(robot, detector, state):
         # ① 粗定位：手外基座坐标 -> 移到目标上方
         print("[①粗定位] 手外 base = [%.3f, %.3f, %.3f]" % (x, y, z))
         robot.grip(GRIP_OPEN_POS, GRIP_OPEN_SPEED, GRIP_OPEN_FORCE)
+        if not normalize_tool_pose(robot):
+            print("[安全中止] 姿态归正未通过，本次抓取结束；夹爪保持打开")
+            return
         above = [x, y, z + LIFT_ABOVE] + TOOL_ORIENTATION
         print("[移动] 粗定位上方 moveL %s" % (["%.3f" % v for v in above],))
         robot.moveL(above, speed=0.05, acceleration=0.05)
+        if not verify_tool_orientation(robot, "粗定位上方"):
+            print("[安全中止] 到达粗定位上方后姿态异常，不执行手内精定位或下降")
+            return
         time.sleep(1)
 
         # ② 精定位：手内多帧重试；失败则立即中止，禁止使用粗定位坐标下降
