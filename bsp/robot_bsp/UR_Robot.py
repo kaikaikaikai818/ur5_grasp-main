@@ -40,6 +40,13 @@ def load_camera_ini(path):
 
 lock = threading.Lock()
 
+# 夹爪 Modbus 寄存器地址（与 bsp/grasp_bsp/grasp_claw.py 一致）
+POSITION_HIGH_8 = 0x0102
+POSITION_LOW_8 = 0x0103
+SPEED = 0x0104
+FORCE = 0x0105
+MOTION_TRIGGER = 0x0108
+
 
 def _rotation_vector_to_matrix(rvec):
     """Rodrigues: 旋转向量 -> 3x3 旋转矩阵"""
@@ -58,7 +65,8 @@ class UR_Robot:
     def __init__(self, robot_ip="192.168.1.35", workspace_limits=None, is_use_robot=True,
                  is_use_camera=True, connect_robot=True, cam2end_path="cam2end_20260906.txt",
                  camera_serial="215222074676", cam_ini_path="camera_20260906.ini",
-                 undistort_img=False):
+                 undistort_img=False, is_use_gripper=True, gripper_port="COM10",
+                 gripper_baudrate=115200, gripper_address=1):
         if workspace_limits is None:
             #workspace_limits = [[-0.450, -0.200], [-0.65, -0.47], [0.003, 0.45]]
             workspace_limits = [[-1, 1], [-1, 1], [0.003, 0.9]]
@@ -86,6 +94,17 @@ class UR_Robot:
         #                      (0 / 360.0) * 2 * np.pi, -(90 / 360.0) * 2 * np.pi,
         #                      -(0 / 360.0) * 2 * np.pi, 0.0]
         self.initial_pose = [-0.4, -0.025, 0.14981, 0.000, 3.141, 0.000]
+        self.home_joint_config = [0.0, -(90 / 360.0) * 2 * np.pi, 0.0,
+                                  -(90 / 360.0) * 2 * np.pi, 0.0, 0.0]
+
+        # -------------------------- 夹爪（Modbus RTU，单独初始化，失败不影响机器人） --------------------------
+        self.is_use_gripper = is_use_gripper
+        self.gripper_port = gripper_port
+        self.gripper_baudrate = gripper_baudrate
+        self.gripper_address = gripper_address
+        self.instrument = None
+        if self.is_use_gripper:
+            self.init_gripper()
 
         if(self.is_use_camera):
             # Fetch RGB-D data from RealSense camera
@@ -134,7 +153,7 @@ class UR_Robot:
         time.sleep(1.5)
 
     def go_home(self):
-        self.move_j(self.home_joint_config)
+        self.moveJ(self.home_joint_config)
 
     def get_actual_tcp_pose(self):
         return self.rtde_r.getActualTCPPose()
@@ -144,6 +163,109 @@ class UR_Robot:
 
     def get_robot_status(self):
         return self.rtde_r.getRobotStatus()
+
+    # -------------------------- 夹爪（Modbus RTU） --------------------------
+    def init_gripper(self):
+        """单独初始化夹爪，失败时仅提示，不阻断机器人"""
+        if not self.is_use_gripper:
+            print("未启用夹爪，跳过初始化")
+            return
+        try:
+            self.instrument = minimalmodbus.Instrument(
+                port=self.gripper_port, slaveaddress=self.gripper_address)
+            self.instrument.serial.baudrate = self.gripper_baudrate
+            self.instrument.serial.timeout = 1
+            self.read_position()
+            print("夹爪初始化成功（端口：%s）" % self.gripper_port)
+        except Exception as e:
+            print("夹爪初始化失败（不影响机器人）：%s" % e)
+            self.instrument = None
+
+    def write_position_high8(self, value):
+        if self.instrument is None:
+            print("夹爪未初始化，无法执行操作")
+            return
+        with lock:
+            self.instrument.write_register(POSITION_HIGH_8, value, functioncode=6)
+
+    def write_position_low8(self, value):
+        if self.instrument is None:
+            print("夹爪未初始化，无法执行操作")
+            return
+        with lock:
+            self.instrument.write_register(POSITION_LOW_8, value, functioncode=6)
+
+    def write_position(self, value):
+        if self.instrument is None:
+            print("夹爪未初始化，无法执行操作")
+            return
+        with lock:
+            self.instrument.write_long(POSITION_HIGH_8, value)
+
+    def write_speed(self, speed):
+        if self.instrument is None:
+            print("夹爪未初始化，无法执行操作")
+            return
+        with lock:
+            self.instrument.write_register(SPEED, speed, functioncode=6)
+
+    def write_force(self, force):
+        if self.instrument is None:
+            print("夹爪未初始化，无法执行操作")
+            return
+        with lock:
+            self.instrument.write_register(FORCE, force, functioncode=6)
+
+    def trigger_motion(self):
+        if self.instrument is None:
+            print("夹爪未初始化，无法执行操作")
+            return
+        with lock:
+            self.instrument.write_register(MOTION_TRIGGER, 1, functioncode=6)
+
+    def read_position(self):
+        if self.instrument is None:
+            print("夹爪未初始化，无法执行操作")
+            return -1
+        with lock:
+            high = self.instrument.read_register(POSITION_HIGH_8, functioncode=3)
+            low = self.instrument.read_register(POSITION_LOW_8, functioncode=3)
+            return (high << 8) | low
+
+    def read_torque_reached(self):
+        """读 0x0601 力矩到达: 1=到达(夹到物体), 0=未到达; 失败返回 -1"""
+        if self.instrument is None:
+            print("夹爪未初始化，无法读取力矩")
+            return -1
+        try:
+            with lock:
+                return self.instrument.read_register(0x0601, functioncode=3)
+        except Exception as e:
+            print("读取力矩到达失败: %s" % e)
+            return -1
+
+    def read_torque_current(self):
+        """读 0x060C 实时力矩/电流: 数值越大越夹紧; 失败返回 -1"""
+        if self.instrument is None:
+            print("夹爪未初始化，无法读取实时力矩")
+            return -1
+        try:
+            with lock:
+                return self.instrument.read_register(0x060C, functioncode=3)
+        except Exception as e:
+            print("读取实时力矩失败: %s" % e)
+            return -1
+
+    def grip(self, position, speed, force):
+        if self.instrument is None:
+            print("夹爪未初始化，无法执行抓取")
+            return -1
+        self.write_position(position)
+        self.write_speed(speed)
+        self.write_force(force)
+        self.trigger_motion()
+        time.sleep(2)
+        return self.read_position()
 
     def pose_vector_to_matrix(self, pose):
         """[x,y,z,rx,ry,rz] (单位 m，旋转向量) -> 4x4 齐次矩阵 (平移单位 mm)"""
