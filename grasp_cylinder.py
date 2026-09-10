@@ -197,7 +197,7 @@ def check_calib(robot, ho_cam):
 
 
 def do_grasp(robot, detector, state):
-    """一键全流程：① 粗定位 -> ② 精定位 -> ③ 下降收爪抬起。失败回退安全。"""
+    """一键全流程：① 粗定位 -> ② 精定位 -> ③ 下降收爪抬起；精定位失败则安全中止。"""
     coarse = state["ho_base"] or state["hi_base"]
     if coarse is None:
         print("[提示] 未检测到红色圆柱，无法抓取")
