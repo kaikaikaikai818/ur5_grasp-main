@@ -46,6 +46,7 @@ OBSERVE_CLEARANCE_M = 0.10
 PREGRASP_CLEARANCE_M = 0.05
 LIFT_DISTANCE_M = 0.10
 MIN_TCP_Z_M = 0.03
+DEFAULT_CYLINDER_GRASP_Z_M = 0.0359
 MAX_XY_STEP_M = 0.40
 MOVE_SPEED = 0.05
 MOVE_ACCELERATION = 0.05
@@ -85,7 +86,11 @@ def parse_args():
     parser.add_argument("--ho-z-offset", type=float, default=0.026,
                         help="Eye-out Z correction in metres (default: 0.026)")
     parser.add_argument("--cylinder-height-mm", type=float, default=50.0,
-                        help="Cylinder height in millimetres (default: 50)")
+                        help="Cylinder height metadata in millimetres (default: 50)")
+    parser.add_argument("--cylinder-grasp-z-m", type=float,
+                        default=DEFAULT_CYLINDER_GRASP_Z_M,
+                        help="Fixed TCP grasp Z for the current platform in metres "
+                             "(default: 0.0359)")
     parser.add_argument("--gripper-port", default=GRIPPER_PORT)
     parser.add_argument("--camera-only", action="store_true",
                         help="Run detection without connecting robot or gripper")
@@ -162,13 +167,15 @@ def safe_move(robot, position, source):
     robot.moveL(pose, speed=MOVE_SPEED, acceleration=MOVE_ACCELERATION)
 
 
-def calculate_tcp_grasp_position(top_center_base, cylinder_height_m):
+def calculate_tcp_grasp_position(top_center_base, fixed_grasp_z_m):
     if TCP_TO_GRASP_CENTER_M is None:
         raise RuntimeError(
             "TCP_TO_GRASP_CENTER_M has not been measured; descent is disabled")
     top = np.asarray(top_center_base, dtype=np.float64)
     grasp_center = top.copy()
-    grasp_center[2] -= cylinder_height_m / 2.0
+    # The current cylinder baseline uses the empirically verified TCP height.
+    # Vision supplies X/Y; its fluctuating top-surface Z is diagnostic only.
+    grasp_center[2] = fixed_grasp_z_m
     return grasp_center - np.asarray(TCP_TO_GRASP_CENTER_M, dtype=np.float64)
 
 
@@ -176,9 +183,13 @@ def main():
     args = parse_args()
     if not math.isfinite(args.cylinder_height_mm) or args.cylinder_height_mm <= 0.0:
         raise ValueError("--cylinder-height-mm must be positive")
+    if not math.isfinite(args.cylinder_grasp_z_m):
+        raise ValueError("--cylinder-grasp-z-m must be finite")
+    if args.cylinder_grasp_z_m < MIN_TCP_Z_M:
+        raise ValueError("--cylinder-grasp-z-m must be at least %.3f m" %
+                         MIN_TCP_Z_M)
     if not math.isfinite(args.ho_z_offset):
         raise ValueError("--ho-z-offset must be finite")
-    cylinder_height_m = args.cylinder_height_mm / 1000.0
     ho_depth_scale = None
     ho_transform = None
     if not args.camera_only:
@@ -200,6 +211,7 @@ def main():
 
         confirmation = input(
             "Confirm the active UR TCP is TCP_clamp (265 mm at finger centre). "
+            "Confirm the cylinder platform height is unchanged. "
             "Type YES to continue: "
         ).strip()
         if confirmation != "YES":
@@ -252,8 +264,12 @@ def main():
             print("One-key mode: A start automatic grasp | O open | R reset | Q quit")
         if not args.camera_only:
             print("[TCP] Using active UR TCP_clamp; Python extra offset is [0, 0, 0] m")
-            print("[CONFIG] cylinder_height=%.1f mm, HO_Z_offset=%.3f m" %
-                  (args.cylinder_height_mm, args.ho_z_offset))
+            print("[CONFIG] cylinder_height=%.1f mm (metadata), "
+                  "fixed_grasp_Z=%.4f m, HO_Z_offset=%.3f m" %
+                  (args.cylinder_height_mm, args.cylinder_grasp_z_m,
+                   args.ho_z_offset))
+            print("[SAFETY] fixed_grasp_Z is valid only for the current "
+                  "platform, 50 mm cylinder and TCP_clamp")
 
         while True:
             ho_color, ho_depth = ho_cam.get_data()
@@ -368,7 +384,8 @@ def main():
                     if stage != Stage.HI_LOCKED or robot is None:
                         print("[BLOCK] lock HI first")
                     else:
-                        grasp_tcp = calculate_tcp_grasp_position(hi_target, cylinder_height_m)
+                        grasp_tcp = calculate_tcp_grasp_position(
+                            hi_target, args.cylinder_grasp_z_m)
                         validate_motion_target(grasp_tcp)
                         pregrasp = grasp_tcp.copy(); pregrasp[2] += PREGRASP_CLEARANCE_M
                         safe_move(robot, pregrasp, "HI-pregrasp")
@@ -423,7 +440,7 @@ def main():
                             raise RuntimeError("HI detection did not become stable before timeout")
                     elif stage == Stage.HI_LOCKED:
                         grasp_tcp = calculate_tcp_grasp_position(
-                            hi_target, cylinder_height_m)
+                            hi_target, args.cylinder_grasp_z_m)
                         # Validate the eventual descent before moving any closer.
                         validate_motion_target(grasp_tcp)
                         pregrasp = grasp_tcp.copy()
@@ -455,7 +472,7 @@ def main():
                                       (xy_shift * 1000.0, z_shift * 1000.0))
                                 hi_target[:2] = verified[:2]
                                 grasp_tcp = calculate_tcp_grasp_position(
-                                    hi_target, cylinder_height_m)
+                                    hi_target, args.cylinder_grasp_z_m)
                                 safe_move(robot, grasp_tcp, "AUTO-descend")
                                 stage = Stage.AT_GRASP
                         if stage == Stage.AT_PREGRASP and now > auto_deadline:
